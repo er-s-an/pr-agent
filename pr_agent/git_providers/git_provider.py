@@ -20,7 +20,7 @@ from pr_agent.algo.comment_identity import (
 )
 from pr_agent.algo.inline_comment_dedup import strip_markers
 from pr_agent.algo.language_handler import build_language_file_matcher, numeric_languages
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import Range, process_description
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
@@ -541,6 +541,14 @@ class GitProvider(ABC):
     @abstractmethod
     def get_diff_files(self) -> list[FilePatchInfo]:
         pass
+
+    def get_auto_filtered_files(self) -> dict[str, EDIT_TYPE]:
+        """Return names and change types omitted by the last diff's automatic file filter.
+
+        Call get_diff_files() first. Explicit [ignore] matches must never be included.
+        Providers that do not retain this metadata return an empty mapping.
+        """
+        return getattr(self, "_auto_filtered_files", {})
 
     def get_incremental_commits(self, is_incremental) -> None:
         return None

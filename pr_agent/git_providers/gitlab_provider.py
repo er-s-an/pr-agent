@@ -291,6 +291,7 @@ class GitLabProvider(GitProvider):
         self.id_mr = None
         self.mr = None
         self.diff_files = None
+        self._auto_filtered_files = {}
         self.git_files = None
         self.temp_comments = []
         self._published_inline_comment_bodies: list[str] = []
@@ -721,6 +722,7 @@ class GitLabProvider(GitProvider):
         # a diff computed under a different incremental scope (or none). Invalidate it so the
         # next get_diff_files() call reflects the scope configured here.
         self.diff_files = None
+        self._auto_filtered_files = {}
         self.mr_commits = None
         if not self.incremental.is_incremental:
             return
@@ -1113,11 +1115,15 @@ class GitLabProvider(GitProvider):
                 pass
 
         diff_files = []
-        invalid_files_names = []
+        auto_filtered_files = {}
         counter_valid = 0
         for diff in diffs:
             if not is_valid_file(diff['new_path']):
-                invalid_files_names.append(diff['new_path'])
+                auto_filtered_files[diff['new_path']] = (
+                    EDIT_TYPE.ADDED if diff['new_file'] else
+                    EDIT_TYPE.DELETED if diff['deleted_file'] else
+                    EDIT_TYPE.RENAMED if diff['renamed_file'] else EDIT_TYPE.MODIFIED
+                )
                 continue
 
             # allow only a limited number of files to be fully loaded. We can manage the rest with diffs only
@@ -1169,10 +1175,11 @@ class GitLabProvider(GitProvider):
                               old_filename=None if diff['old_path'] == diff['new_path'] else diff['old_path'],
                               num_plus_lines=num_plus_lines,
                               num_minus_lines=num_minus_lines, ))
-        if invalid_files_names:
-            get_logger().info(f"Filtered out files with invalid extensions: {invalid_files_names}")
+        if auto_filtered_files:
+            get_logger().info(f"Filtered out files with invalid extensions: {list(auto_filtered_files)}")
 
         self.diff_files = diff_files
+        self._auto_filtered_files = auto_filtered_files
         return diff_files
 
     def get_files(self) -> list:

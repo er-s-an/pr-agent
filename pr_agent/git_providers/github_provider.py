@@ -86,6 +86,7 @@ class GithubProvider(GitProvider):
         self.issue_main = None
         self.github_user_id = None
         self.diff_files = None
+        self._auto_filtered_files = {}
         self.git_files = None
         self.incremental = IncrementalPR(False)
         self._resolved_config_branch: str | None = None
@@ -127,16 +128,20 @@ class GithubProvider(GitProvider):
 
     def reset_diff_cache_for_command(self) -> None:
         self.diff_files = None
+        self._auto_filtered_files = {}
         if context.exists():
             context.pop("diff_files", None)
+            context.pop("auto_filtered_files", None)
         self.incremental = IncrementalPR(False)
 
     def get_incremental_commits(self, incremental: Optional[IncrementalPR] = None):
         # Constructed per call: a default in the signature is one object shared by every provider that omits it.
         # Invalidate completed diffs when the file scope is being reconfigured.
         self.diff_files = None
+        self._auto_filtered_files = {}
         if context.exists():
             context.pop("diff_files", None)
+            context.pop("auto_filtered_files", None)
         self.incremental = incremental if incremental is not None else IncrementalPR(False)
         if self.incremental.is_incremental:
             self.unreviewed_files_map = dict()
@@ -387,6 +392,7 @@ class GithubProvider(GitProvider):
             try:
                 diff_files = context.get("diff_files", None)
                 if diff_files:
+                    self._auto_filtered_files = context.get("auto_filtered_files", {})
                     return diff_files
             except ContextDoesNotExistError:
                 # Skip the per-request cache outside a request cycle; fall through and compute the files.
@@ -410,7 +416,7 @@ class GithubProvider(GitProvider):
                     pass
 
             diff_files = []
-            invalid_files_names = []
+            auto_filtered_files = {}
             is_close_to_rate_limit = False
 
             # The base.sha will point to the current state of the base branch (including
@@ -433,7 +439,12 @@ class GithubProvider(GitProvider):
             counter_valid = 0
             for file in files:
                 if not is_valid_file(file.filename):
-                    invalid_files_names.append(file.filename)
+                    auto_filtered_files[file.filename] = {
+                        "added": EDIT_TYPE.ADDED,
+                        "removed": EDIT_TYPE.DELETED,
+                        "modified": EDIT_TYPE.MODIFIED,
+                        "renamed": EDIT_TYPE.RENAMED,
+                    }.get(file.status, EDIT_TYPE.UNKNOWN)
                     continue
 
                 patch = file.patch
@@ -501,12 +512,14 @@ class GithubProvider(GitProvider):
                                                                num_plus_lines=num_plus_lines,
                                                                num_minus_lines=num_minus_lines,)
                 diff_files.append(file_patch_canonical_structure)
-            if invalid_files_names:
-                get_logger().info(f"Filtered out files with invalid extensions: {invalid_files_names}")
+            if auto_filtered_files:
+                get_logger().info(f"Filtered out files with invalid extensions: {list(auto_filtered_files)}")
 
             self.diff_files = diff_files
+            self._auto_filtered_files = auto_filtered_files
             try:
                 context["diff_files"] = diff_files
+                context["auto_filtered_files"] = auto_filtered_files
             except ContextDoesNotExistError:
                 # Skip caching outside a request cycle; the value is already on self.
                 pass

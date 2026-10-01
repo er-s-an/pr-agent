@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
+from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Callable, List, Tuple
@@ -83,6 +84,27 @@ def _append_metadata_section(
         return candidate, candidate_tokens, clipped_section
 
     return final_diff, curr_token, ""
+
+
+def _append_auto_filtered_files(final_diff, git_provider, token_handler, max_tokens):
+    """Include complete omitted-file names without exceeding the current attempt's budget."""
+    get_filtered = getattr(git_provider, "get_auto_filtered_files", None)
+    filtered = get_filtered() if callable(get_filtered) else None
+    if not isinstance(filtered, Mapping) or not filtered:
+        return final_diff
+
+    header = "Files changed but automatically filtered from the diff (contents not reviewed):"
+    lines = [f"{edit_type.name.lower()}: {filename!r}" for filename, edit_type in filtered.items()]
+
+    def candidate(prefix):
+        return final_diff + "\n\n" + header + "\n" + "\n".join(prefix)
+
+    def fits(prefix):
+        total = token_handler.prompt_tokens + _count_raw_and_stripped_tokens(token_handler, candidate(prefix))
+        return total <= max_tokens
+
+    count = _find_verified_fitting_prefix_length(lines, len(lines), fits)
+    return candidate(lines[:count]) if count else final_diff
 
 
 def _find_verified_fitting_prefix_length(items, max_length: int, fits: Callable[[list], bool]) -> int:
@@ -183,6 +205,9 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
         get_logger().info(f"Tokens: {total_tokens}, total tokens under limit: {budget.context_window}, "
                           f"returning full diff.")
         full_diff = "\n".join(patches_extended)
+        full_diff = _append_auto_filtered_files(
+            full_diff, git_provider, token_handler, token_handler.prompt_tokens + hard_token_budget
+        )
         if return_prepared:
             return PreparedPRDiff(full_diff, [], model=model,
                                   add_line_numbers_to_hunks=add_line_numbers_to_hunks,
@@ -257,6 +282,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     final_diff, curr_token, deleted_list_str = _append_metadata_section(
         final_diff, curr_token, deleted_list_str, max_tokens, token_handler
     )
+
+    final_diff = _append_auto_filtered_files(final_diff, git_provider, token_handler, max_tokens)
 
     get_logger().debug(f"After pruning, added_list_str: {added_list_str}, modified_list_str: {modified_list_str}, "
                        f"deleted_list_str: {deleted_list_str}")
