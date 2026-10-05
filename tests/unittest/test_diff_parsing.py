@@ -1,3 +1,9 @@
+import os
+import subprocess
+import sys
+
+import pytest
+
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file
 
@@ -203,3 +209,147 @@ def test_reconstruct_base_file_emptied():
     # Every line removed but the file kept: `+0,0` must not be read as out of bounds.
     # (Only the lines are checked; the trailing newline follows the EOF handling.)
     assert reconstruct_base_file("", _EMPTIED_FILE_PATCH).splitlines() == ["a", "b"]
+
+
+@pytest.mark.parametrize(("name", "escaped"), [
+    ("café.py", r"caf\303\251.py"),
+    ("café notes.py", r"caf\303\251 notes.py"),
+    ("src/你好.py", r"src/\344\275\240\345\245\275.py"),
+    ('quo"te.py', r'quo\"te.py'),
+    ("back\\slash.py", r"back\\slash.py"),
+    ('café"note.py', r'café\"note.py'),
+])
+@pytest.mark.parametrize("edit_type", [EDIT_TYPE.MODIFIED, EDIT_TYPE.ADDED, EDIT_TYPE.DELETED, EDIT_TYPE.RENAMED])
+def test_parse_git_quoted_paths(name, escaped, edit_type):
+    # Match the byte-oriented C quoting emitted by git diff with core.quotePath=true.
+    source = f'"a/{escaped}"'
+    target = f'"b/{escaped}"'
+    old_filename = None
+    if edit_type == EDIT_TYPE.ADDED:
+        patch = f"new file mode 100644\n--- /dev/null\n+++ {target}\n@@ -0,0 +1 @@\n+new\n"
+    elif edit_type == EDIT_TYPE.DELETED:
+        patch = f"deleted file mode 100644\n--- {source}\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+    elif edit_type == EDIT_TYPE.RENAMED:
+        old_filename = "old " + name
+        source = f'"a/old {escaped}"'
+        patch = f'similarity index 100%\nrename from "old {escaped}"\nrename to "{escaped}"\n'
+    else:
+        patch = f"--- {source}\n+++ {target}\n@@ -1 +1 @@\n-old\n+new\n"
+
+    diff = f"diff --git {source} {target}\n{patch}"
+    files = parse_unified_diff(diff)
+    assert len(files) == 1
+    file = files[0]
+
+    assert file.filename == name
+    assert file.old_filename == old_filename
+    assert file.edit_type == edit_type
+
+
+def test_parse_unquoted_space_path():
+    diff = MODIFY_DIFF.replace("foo.py", "plain file.py")
+    file = parse_unified_diff(diff)[0]
+    assert file.filename == "plain file.py"
+    assert file.edit_type == EDIT_TYPE.MODIFIED
+    assert len(parse_unified_diff(diff)) == 1
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_quoted_path_normalization_preserves_hunk_text(newline):
+    from pr_agent.git_providers.diff_parsing import _normalize_git_path_headers, to_hunk_only_patch
+
+    metadata = newline.join([
+        r'diff --git "a/caf\303\251 notes.py" "b/caf\303\251 notes.py"',
+        r'--- "a/caf\303\251 notes.py"',
+        r'+++ "b/caf\303\251 notes.py"',
+    ]) + newline
+    hunk = newline.join([
+        "@@ -1,2 +1,2 @@",
+        '--- "a/file with spaces"',
+        '+++ "b/file with spaces"',
+        " unchanged",
+        "",
+    ])
+    diff = metadata + hunk
+
+    normalized = _normalize_git_path_headers(diff)
+    files = parse_unified_diff(diff)
+
+    assert normalized[normalized.index("@@"):] == hunk
+    assert len(files) == 1
+    # unidiff serializes the hunk header, so compare its source lines separately.
+    assert to_hunk_only_patch(files[0].patch).split("\n", 1)[1] == hunk.split("\n", 1)[1]
+    assert files[0].filename == "café notes.py"
+
+
+@pytest.mark.parametrize("source,target,old_name,new_name", [
+    ('a/old b/file.py', r'"b/caf\303\251.py"', "old b/file.py", "café.py"),
+    ('a/old name.py', r'"b/caf\303\251 notes.py"', "old name.py", "café notes.py"),
+    (r'"a/caf\303\251 notes.py"', 'b/new name.py', "café notes.py", "new name.py"),
+])
+def test_rename_only_with_mixed_quoted_paths(source, target, old_name, new_name):
+    diff = f"diff --git {source} {target}\nsimilarity index 100%\nrename from old\nrename to new\n"
+    files = parse_unified_diff(diff)
+
+    assert len(files) == 1
+    assert files[0].filename == new_name
+    assert files[0].old_filename == old_name
+    assert files[0].edit_type == EDIT_TYPE.RENAMED
+
+
+def test_mode_only_quoted_path_is_not_a_rename():
+    diff = (
+        r'diff --git "a/caf\303\251 notes.py" "b/caf\303\251 notes.py"' "\n"
+        "old mode 100644\nnew mode 100755\n"
+    )
+    files = parse_unified_diff(diff)
+
+    assert len(files) == 1
+    assert files[0].filename == "café notes.py"
+    assert files[0].edit_type == EDIT_TYPE.MODIFIED
+    assert files[0].old_filename is None
+    assert "old mode 100644\nnew mode 100755\n" in files[0].patch
+
+
+def test_reconstruct_base_with_quoted_space_path():
+    diff = (
+        r'diff --git "a/caf\303\251 notes.py" "b/caf\303\251 notes.py"' "\n"
+        r'--- "a/caf\303\251 notes.py"' "\n"
+        r'+++ "b/caf\303\251 notes.py"' "\n"
+        "@@ -1,3 +1,3 @@\n header\n-old\n+new\n footer\n"
+    )
+
+    assert reconstruct_base_file("header\nnew\nfooter\n", diff) == "header\nold\nfooter\n"
+
+
+def test_quoted_path_normalization_resets_for_unprefixed_diff():
+    diff = (
+        r'diff --git "caf\303\251.py" "caf\303\251.py"' "\n"
+        "old mode 100644\nnew mode 100755\n"
+        "diff --git plain.py plain.py\n"
+        "--- plain.py\n+++ plain.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    files = parse_unified_diff(diff)
+
+    assert [file.filename for file in files] == ["café.py", "plain.py"]
+    assert reconstruct_base_file("new\n", files[1].patch) == "old\n"
+
+
+def test_diff_parser_does_not_require_git_executable(tmp_path):
+    env = dict(os.environ, PATH=str(tmp_path), GIT_PYTHON_GIT_EXECUTABLE=str(tmp_path / "missing-git"))
+    result = subprocess.run(
+        [sys.executable, "-c", "from pr_agent.git_providers.diff_parsing import parse_unified_diff"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_undecodable_git_path_preserves_surrogateescaped_input():
+    from pr_agent.git_providers.diff_parsing import _strip_prefix
+
+    path = '"b/bad' + chr(0xDCFF) + r'\".py"'
+    assert _strip_prefix(path) == path

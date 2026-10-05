@@ -1,9 +1,51 @@
+import re
+
 from unidiff import PatchSet
 from unidiff.errors import UnidiffParseError
 
 from pr_agent.algo.git_patch_processing import to_hunk_only_patch as _to_hunk_only_patch
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.log import get_logger
+
+_C_ESCAPE = re.compile(rb'\\([0-3][0-7]{2}|[abfnrtv"\\])')
+_C_ESCAPES = {b"a": b"\a", b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r", b"t": b"\t", b"v": b"\v"}
+_QUOTED_PATH = r'"(?:[^"\\]|\\.)*"'
+_GIT_HEADER = re.compile(rf'^diff --git (?P<source>{_QUOTED_PATH}|a/[^"]+?) (?P<target>{_QUOTED_PATH}|b/[^"]+)$')
+
+
+def _normalize_git_path_headers(diff_text: str) -> str:
+    """Keep C-quoted spaces out of unidiff's whitespace-based Git header split."""
+    def quote_path(path: str) -> str:
+        if path == "/dev/null":
+            return path
+        if not (path.startswith('"') and path.endswith('"')):
+            path = f'"{path}"'
+        return path.replace(" ", r"\040")
+
+    lines = diff_text.split("\n")
+    normalize = False
+    in_hunk = False
+    for index, line in enumerate(lines):
+        ending = "\r" if line.endswith("\r") else ""
+        content = line[:-1] if ending else line
+        header = _GIT_HEADER.match(content)
+        if header:
+            source, target = header.group("source", "target")
+            normalize = source.startswith('"') or target.startswith('"')
+            in_hunk = False
+            if normalize:
+                lines[index] = f"diff --git {quote_path(source)} {quote_path(target)}"
+        elif content.startswith("diff --git "):
+            normalize = False
+            in_hunk = False
+        elif content.startswith("@@"):
+            in_hunk = True
+        elif normalize and not in_hunk and content.startswith(("--- ", "+++ ")):
+            path, separator, timestamp = content[4:].partition("\t")
+            lines[index] = f"{content[:4]}{quote_path(path)}{separator}{timestamp}"
+        elif normalize and not in_hunk:
+            lines[index] = content
+    return "\n".join(lines)
 
 
 def to_hunk_only_patch(patch_str: str) -> str:
@@ -14,6 +56,15 @@ def to_hunk_only_patch(patch_str: str) -> str:
 def _strip_prefix(path: str | None) -> str | None:
     if path is None:
         return None
+    if path.startswith('"') and path.endswith('"'):
+        def decode_escape(match: re.Match) -> bytes:
+            escape = match.group(1)
+            return bytes([int(escape, 8)]) if len(escape) == 3 else _C_ESCAPES.get(escape, escape)
+
+        try:
+            path = _C_ESCAPE.sub(decode_escape, path[1:-1].encode("utf-8")).decode("utf-8")
+        except UnicodeError:
+            return path
     if path.startswith(("a/", "b/")):
         return path[2:]
     return path
@@ -25,7 +76,7 @@ def parse_unified_diff(diff_text: str) -> list[FilePatchInfo]:
     base_file / head_file are left empty here; the provider fills them from the
     working tree and by reverse-applying the patch. Binary files are skipped.
     """
-    patch_set = PatchSet(diff_text)
+    patch_set = PatchSet(_normalize_git_path_headers(diff_text))
     files: list[FilePatchInfo] = []
     for pf in patch_set:
         if pf.is_binary_file:
@@ -63,7 +114,7 @@ def reconstruct_base_file(head_file_str: str, patch_str: str) -> str:
     """Reverse-apply a single-file unified diff to head (new) content to recover
     base (original) content. Returns "" if the patch does not cleanly apply."""
     try:
-        patch_set = PatchSet(patch_str)
+        patch_set = PatchSet(_normalize_git_path_headers(patch_str))
     except UnidiffParseError as e:
         get_logger().info(f"Could not parse patch for base reconstruction: {e}")
         return ""

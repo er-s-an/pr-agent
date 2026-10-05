@@ -387,3 +387,48 @@ def test_get_issue_comments_returns_empty(cfg):
     cfg("plain_diff.output_path", None)
     provider = PlainDiffGitProvider(None)
     assert list(provider.get_issue_comments()) == []
+
+
+@pytest.mark.parametrize("name", ["café.py", "café notes.py"])
+def test_git_quoted_filename_preserves_worktree_context(cfg, tmp_path, monkeypatch, name):
+    (tmp_path / ".git").mkdir()
+    head = "header\nnew\nfooter\n"
+    (tmp_path / name).write_text(head, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    escaped = name.replace("é", r"\303\251")
+    diff = (
+        f'diff --git "a/{escaped}" "b/{escaped}"\n'
+        f'--- "a/{escaped}"\n+++ "b/{escaped}"\n'
+        "@@ -1,3 +1,3 @@\n header\n-old\n+new\n footer\n"
+    )
+    cfg("plain_diff.content", diff)
+    cfg("plain_diff.output_path", None)
+
+    provider = PlainDiffGitProvider(None)
+    file = provider.get_diff_files()[0]
+
+    assert file.filename == name
+    assert file.head_file == head
+    assert file.base_file == "header\nold\nfooter\n"
+    assert provider.get_files() == [name]
+    assert provider.get_languages() == {"Python": 100.0}
+
+
+def test_invalid_utf8_git_path_does_not_alias_worktree_filename(cfg, tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "bad�.py").write_text("new\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    diff = (
+        r'diff --git "a/bad\377.py" "b/bad\377.py"' "\n"
+        r'--- "a/bad\377.py"' "\n"
+        r'+++ "b/bad\377.py"' "\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    cfg("plain_diff.content", diff)
+    cfg("plain_diff.output_path", None)
+
+    file = PlainDiffGitProvider(None).get_diff_files()[0]
+
+    assert file.filename == r'"b/bad\377.py"'
+    assert file.head_file == ""
+    assert file.base_file == ""
